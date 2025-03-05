@@ -1,6 +1,5 @@
 import os
-from pydantic import BaseModel
-
+from sentence_transformers import SentenceTransformer, util
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -15,80 +14,70 @@ DATA_PATH = "data/"
 # 🔹 Step 1: Load PDF Files
 def load_pdf_files(data: str):
     """
-    Loads all PDF documents from the specified directory.
-
-    Parameters:
-    data (str): The path to the directory containing PDF files.
-
-    Returns:
-    List[Document]: A list of document objects extracted from PDFs.
+    Load all PDF files from the specified directory.
+    
+    Input:
+        - data (str): Path to the directory containing PDF files.
+    Output:
+        - List of documents extracted from PDFs.
     """
     loader = DirectoryLoader(data, glob='*.pdf', loader_cls=PyPDFLoader)
-    documents = loader.load()
-    return documents
+    return loader.load()
 
-# Load PDF documents
 documents = load_pdf_files(DATA_PATH)
 
 # 🔹 Step 2: Create Chunks
 def create_chunks(extracted_data):
     """
-    Splits the extracted text documents into smaller chunks.
-
-    Parameters:
-    extracted_data (List[Document]): A list of document objects.
-
-    Returns:
-    List[Document]: A list of smaller text chunks.
+    Split extracted documents into smaller text chunks for better processing.
+    
+    Input:
+        - extracted_data (list): List of extracted documents.
+    Output:
+        - List of text chunks with defined size and overlap.
     """
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    text_chunks = text_splitter.split_documents(extracted_data)
-    return text_chunks
+    return text_splitter.split_documents(extracted_data)
 
-# Split text into chunks
 text_chunks = create_chunks(documents)
 
 # 🔹 Step 3: Create Vector Embeddings
 def get_embedding_model():
     """
-    Loads the sentence transformer model for text embedding.
-
-    Returns:
-    HuggingFaceEmbeddings: The embedding model instance.
+    Load a pre-trained Sentence Transformer model for embedding generation.
+    
+    Input: None
+    Output:
+        - Pre-trained embedding model instance.
     """
     return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# Load embedding model
 embedding_model = get_embedding_model()
 
 # 🔹 Step 4: Store embeddings in FAISS
 DB_FAISS_PATH = "vectorstore/db_faiss"
 
-# Create FAISS database from text chunks
 db = FAISS.from_documents(text_chunks, embedding_model)
 db.save_local(DB_FAISS_PATH)
 
-# 🔹 Step 5: Setup LLM (Mistral with HuggingFace)
-
+# 🔹 Step 5: Setup LLM
 HF_TOKEN = os.environ.get("HF_TOKEN")
 HUGGINGFACE_REPO_ID = "mistralai/Mistral-7B-Instruct-v0.3"
 
 def load_llm(huggingface_repo_id: str):
     """
-    Loads a Hugging Face language model using the given repository ID.
-
-    Parameters:
-    huggingface_repo_id (str): The repository ID of the model on Hugging Face.
-
-    Returns:
-    HuggingFaceEndpoint: The loaded LLM instance.
+    Load a pre-trained Large Language Model (LLM) from Hugging Face.
+    
+    Input:
+        - huggingface_repo_id (str): Model repository ID from Hugging Face.
+    Output:
+        - Loaded LLM instance ready for inference.
     """
-    llm = HuggingFaceEndpoint(
+    return HuggingFaceEndpoint(
         repo_id=huggingface_repo_id,
-        temperature=0.5,
+        temperature=0.8,
         model_kwargs={"token": HF_TOKEN, "max_length": "512"}
     )
-    return llm
 
 # 🔹 Step 6: Custom Prompt Template
 CUSTOM_PROMPT_TEMPLATE = """
@@ -104,13 +93,12 @@ Start the answer directly. No small talk, please.
 
 def set_custom_prompt(custom_prompt_template: str):
     """
-    Creates a custom prompt template for the LLM.
-
-    Parameters:
-    custom_prompt_template (str): The prompt template string.
-
-    Returns:
-    PromptTemplate: A formatted prompt template object.
+    Define a custom prompt template for the retrieval-augmented LLM.
+    
+    Input:
+        - custom_prompt_template (str): A formatted string defining the prompt.
+    Output:
+        - PromptTemplate instance.
     """
     return PromptTemplate(template=custom_prompt_template, input_variables=["context", "question"])
 
@@ -120,16 +108,40 @@ db = FAISS.load_local(DB_FAISS_PATH, embedding_model, allow_dangerous_deserializ
 qa_chain = RetrievalQA.from_chain_type(
     llm=load_llm(HUGGINGFACE_REPO_ID),
     chain_type="stuff",
-    retriever=db.as_retriever(search_kwargs={'k': 3}),
+    retriever=db.as_retriever(search_kwargs={'k': 7}),
     return_source_documents=True,
     chain_type_kwargs={'prompt': set_custom_prompt(CUSTOM_PROMPT_TEMPLATE)}
 )
 
-# 🔹 Step 8: Get User Query and Generate Response
-user_query = input("Write Query Here: ")
+# 🔹 Step 8: Find Most Relevant Sentences
+def highlight_relevant_text(answer, source_docs):
+    """
+    Find and highlight the most relevant sentences in the source documents.
+    
+    Input:
+        - answer (str): The generated response from the LLM.
+        - source_docs (list): List of documents retrieved as relevant sources.
+    Output:
+        - String containing relevant document excerpts with highlighted sentences.
+    """
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    answer_embedding = model.encode(answer, convert_to_tensor=True)
+    highlighted_texts = []
+    
+    for doc in source_docs:
+        sentences = doc.page_content.split(". ")
+        sentence_embeddings = model.encode(sentences, convert_to_tensor=True)
+        similarities = util.pytorch_cos_sim(answer_embedding, sentence_embeddings)
+        most_relevant_idx = similarities.argmax().item()
+        most_relevant_sentence = sentences[most_relevant_idx]
+        highlighted_texts.append(f"**Document:**\n{doc.page_content}\n\n**Most Relevant:** {most_relevant_sentence}\n")
+    
+    return "\n\n".join(highlighted_texts)
 
+# 🔹 Step 9: Get User Query and Generate Response
+user_query = input("Write Query Here: ")
 response = qa_chain.invoke({'query': user_query})
 
-# 🔹 Step 9: Print the Results
-print("RESULT:", response["result"])
-print("SOURCE DOCUMENTS:", response["source_documents"])
+# 🔹 Step 10: Print the Results
+print("\nRESULT:\n", response["result"])
+print("\n**Relevant Source Information:**\n", highlight_relevant_text(response["result"], response["source_documents"]))
